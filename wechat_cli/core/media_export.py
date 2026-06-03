@@ -9,6 +9,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +34,7 @@ _WXGF_SIGNATURE = b"wxgf"
 _KVCOMM_STATISTIC_RE = re.compile(r"^(?:key_(?:reportnow_)?)?(\d+)_.*\.statistic$")
 _HEX32_RE = re.compile(r"^[a-fA-F0-9]{32}$")
 _SUCCESS_MEDIA_STATUSES = {"copied", "decoded", "downloaded"}
+_STICKER_CACHE_EXTENSIONS = ("gif", "png", "jpg", "jpeg", "webp", "bmp")
 _MAX_STICKER_DOWNLOAD_BYTES = 100 * 1024 * 1024
 _STICKER_DOWNLOAD_HEADERS = {
     "User-Agent": "MicroMessenger Client",
@@ -169,6 +171,7 @@ Common fields:
 - `bytes`: written asset size in bytes when available.
 - `width` / `height`: final exported visual asset dimensions in pixels when available.
 - `duration_ms`: final exported audio/video duration in milliseconds when available.
+- `cache_hit`: `true` when a sticker was reused from the persistent user cache.
 - `original_filename`: source filename when available.
 - `detail`: warning/error detail for non-success statuses.
 
@@ -225,6 +228,7 @@ def materialize_record_media(records, assets_dir, output_path, download_stickers
                 download_stickers=download_stickers, sticker_cache=sticker_cache,
             )
             probe_warning = entry.pop("_probe_warning", "")
+            entry.pop("_asset_path", None)
             media_entries.append(entry)
             if entry["status"] not in _SUCCESS_MEDIA_STATUSES:
                 warnings.append({
@@ -313,6 +317,12 @@ def _materialize_sticker(
     if cached_entry:
         return cached_entry
 
+    persistent_entry = _copy_persistent_sticker_cache(
+        source, record, index, assets_dir, rel_assets_root, used_names
+    )
+    if persistent_entry:
+        return _cache_sticker_entry(sticker_cache, source, persistent_entry)
+
     source_path = source.get("source_path")
     local_error = ""
     if source_path and os.path.exists(source_path):
@@ -320,6 +330,7 @@ def _materialize_sticker(
             source, record, index, assets_dir, rel_assets_root, used_names
         )
         if local_result:
+            _store_persistent_sticker_cache(source, local_result)
             return _cache_sticker_entry(sticker_cache, source, local_result)
         local_error = "local sticker cache could not be decoded"
 
@@ -329,6 +340,7 @@ def _materialize_sticker(
             source, record, index, assets_dir, rel_assets_root, used_names, download_errors
         )
         if downloaded:
+            _store_persistent_sticker_cache(source, downloaded)
             return _cache_sticker_entry(sticker_cache, source, downloaded)
 
     if source_path and os.path.exists(source_path):
@@ -417,6 +429,93 @@ def _download_sticker_asset(source, record, index, assets_dir, rel_assets_root, 
     return None
 
 
+def _copy_persistent_sticker_cache(source, record, index, assets_dir, rel_assets_root, used_names):
+    cache_path = _find_persistent_sticker_cache(source)
+    if not cache_path:
+        return None
+    cache_source = dict(source)
+    cache_source["source_path"] = cache_path
+    cache_source["cache_hit"] = True
+    return _copy_source(
+        cache_source, record, index, assets_dir, rel_assets_root, used_names, status="copied"
+    )
+
+
+def _find_persistent_sticker_cache(source):
+    sticker_md5 = _sticker_md5(source)
+    if not sticker_md5:
+        return None
+    cache_dir = _sticker_cache_dir()
+    for ext in _STICKER_CACHE_EXTENSIONS:
+        path = os.path.join(cache_dir, f"{sticker_md5}.{ext}")
+        if _valid_persistent_sticker_cache_file(path, sticker_md5):
+            return path
+    return None
+
+
+def _store_persistent_sticker_cache(source, entry):
+    sticker_md5 = _sticker_md5(source)
+    asset_path = entry.get("_asset_path")
+    if not sticker_md5 or not asset_path:
+        return
+    try:
+        with open(asset_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return
+    detected = detect_image_bytes(data)
+    if not detected or hashlib.md5(data).hexdigest().lower() != sticker_md5:
+        return
+
+    ext, _ = detected
+    cache_dir = _sticker_cache_dir()
+    cache_path = os.path.join(cache_dir, f"{sticker_md5}.{ext}")
+    if _valid_persistent_sticker_cache_file(cache_path, sticker_md5):
+        return
+
+    tmp_path = None
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, cache_path)
+    except OSError:
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _valid_persistent_sticker_cache_file(path, sticker_md5):
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return False
+    return bool(detect_image_bytes(data)) and hashlib.md5(data).hexdigest().lower() == sticker_md5
+
+
+def _sticker_md5(source):
+    sticker_md5 = (source.get("sticker_md5") or "").strip().lower()
+    if _HEX32_RE.fullmatch(sticker_md5):
+        return sticker_md5
+    return ""
+
+
+def _sticker_cache_dir():
+    configured = os.environ.get("WECHAT_CLI_STICKER_CACHE_DIR")
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    if sys.platform == "darwin":
+        return os.path.expanduser(os.path.join("~", "Library", "Caches", "wechat-cli", "stickers"))
+    cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(os.path.join("~", ".cache"))
+    return os.path.abspath(os.path.join(os.path.expanduser(cache_root), "wechat-cli", "stickers"))
+
+
 def _cached_sticker_entry(sticker_cache, source):
     for key in _sticker_cache_keys(source):
         cached = sticker_cache.get(key)
@@ -430,6 +529,7 @@ def _cache_sticker_entry(sticker_cache, source, entry):
         return entry
     cached = dict(entry)
     cached.pop("_probe_warning", None)
+    cached.pop("_asset_path", None)
     for key in _sticker_cache_keys(source):
         sticker_cache.setdefault(key, cached)
     return entry
@@ -437,7 +537,7 @@ def _cache_sticker_entry(sticker_cache, source, entry):
 
 def _sticker_cache_keys(source):
     keys = []
-    sticker_md5 = (source.get("sticker_md5") or "").strip().lower()
+    sticker_md5 = _sticker_md5(source)
     if sticker_md5:
         keys.append(("md5", sticker_md5))
     for field_name in ("cdn_url", "encrypt_url"):
@@ -616,6 +716,8 @@ def _media_status_entry(source, status, detail=""):
         entry["original_filename"] = source["original_filename"]
     if source.get("source_label"):
         entry["source"] = source["source_label"]
+    if source.get("cache_hit"):
+        entry["cache_hit"] = True
     for source_key, entry_key in (
         ("sticker_md5", "md5"),
         ("expected_bytes", "expected_bytes"),
@@ -635,6 +737,7 @@ def _media_file_entry(source, status, rel_path, dest_path, mime=None, detail="")
     entry = _media_status_entry(source, status, detail=detail)
     entry["path"] = rel_path
     entry["mime"] = mime or "application/octet-stream"
+    entry["_asset_path"] = dest_path
     try:
         entry["bytes"] = os.path.getsize(dest_path)
     except OSError:

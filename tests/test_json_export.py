@@ -19,6 +19,7 @@ from wechat_cli.core.media_export import (
     materialize_record_media,
     prepare_export_targets,
     readme_path_for_output,
+    _sticker_cache_dir,
 )
 from wechat_cli.core.messages import collect_chat_export_records
 
@@ -230,6 +231,43 @@ def _aes_cbc_pkcs7_encrypt(data, aeskey):
 
 
 class JsonExportTests(unittest.TestCase):
+    def setUp(self):
+        self._sticker_cache_tmp = tempfile.TemporaryDirectory()
+        self.sticker_cache_dir = os.path.join(self._sticker_cache_tmp.name, "stickers")
+        self._sticker_cache_patcher = patch(
+            "wechat_cli.core.media_export._sticker_cache_dir",
+            return_value=self.sticker_cache_dir,
+        )
+        self._sticker_cache_patcher.start()
+
+    def tearDown(self):
+        self._sticker_cache_patcher.stop()
+        self._sticker_cache_tmp.cleanup()
+
+    def test_sticker_cache_dir_uses_macos_user_cache(self):
+        with patch.dict(os.environ, {"HOME": "/Users/test"}, clear=True):
+            with patch("wechat_cli.core.media_export.sys.platform", "darwin"):
+                self.assertEqual(
+                    _sticker_cache_dir(),
+                    "/Users/test/Library/Caches/wechat-cli/stickers",
+                )
+
+    def test_sticker_cache_dir_uses_xdg_cache_on_non_macos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": tmp}, clear=True):
+                with patch("wechat_cli.core.media_export.sys.platform", "linux"):
+                    self.assertEqual(
+                        _sticker_cache_dir(),
+                        os.path.join(tmp, "wechat-cli", "stickers"),
+                    )
+
+    def test_sticker_cache_dir_allows_env_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            override = os.path.join(tmp, "custom-stickers")
+            with patch.dict(os.environ, {"WECHAT_CLI_STICKER_CACHE_DIR": override}, clear=True):
+                with patch("wechat_cli.core.media_export.sys.platform", "darwin"):
+                    self.assertEqual(_sticker_cache_dir(), override)
+
     def test_decode_wechat_image_dat_detects_xor_jpeg(self):
         jpeg = bytes.fromhex("ffd8ffe000104a464946") + b"payload"
         decoded = decode_wechat_image_dat(_xor(jpeg))
@@ -555,6 +593,72 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(media["source"], "cdnurl")
             self.assertEqual(media["mime"], "image/gif")
             self.assertEqual(media["md5"], sticker_md5)
+            self.assertEqual(media["width"], 300)
+            self.assertEqual(media["height"], 304)
+            self.assertTrue(media["path"].startswith("chat_assets/stickers/"))
+            with open(os.path.join(tmp, media["path"]), "rb") as f:
+                self.assertEqual(f.read(), gif)
+
+    def test_materialize_sticker_writes_persistent_cache_after_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gif = _gif_bytes()
+            sticker_md5 = hashlib.md5(gif).hexdigest()
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [{
+                "local_id": 47,
+                "time": "2026-06-03 10:18:00",
+                "_media_sources": [{
+                    "kind": "sticker",
+                    "original_filename": sticker_md5,
+                    "sticker_md5": sticker_md5,
+                    "cdn_url": "https://example.test/cdn",
+                }],
+            }]
+
+            with patch("wechat_cli.core.media_export._download_url", return_value=(gif, "")):
+                warnings = materialize_record_media(
+                    records, assets_dir, output_path, download_stickers=True
+                )
+
+            self.assertEqual(warnings, [])
+            cache_path = os.path.join(self.sticker_cache_dir, f"{sticker_md5}.gif")
+            self.assertTrue(os.path.exists(cache_path))
+            with open(cache_path, "rb") as f:
+                self.assertEqual(f.read(), gif)
+
+    def test_materialize_sticker_uses_persistent_cache_without_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gif = _gif_bytes()
+            sticker_md5 = hashlib.md5(gif).hexdigest()
+            os.makedirs(self.sticker_cache_dir)
+            with open(os.path.join(self.sticker_cache_dir, f"{sticker_md5}.gif"), "wb") as f:
+                f.write(gif)
+
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [{
+                "local_id": 50,
+                "time": "2026-06-03 10:20:00",
+                "_media_sources": [{
+                    "kind": "sticker",
+                    "original_filename": sticker_md5,
+                    "sticker_md5": sticker_md5,
+                    "cdn_url": "https://example.test/cdn",
+                }],
+            }]
+
+            with patch("wechat_cli.core.media_export._download_url") as download:
+                warnings = materialize_record_media(
+                    records, assets_dir, output_path, download_stickers=False
+                )
+
+            download.assert_not_called()
+            self.assertEqual(warnings, [])
+            media = records[0]["media"][0]
+            self.assertEqual(media["status"], "copied")
+            self.assertTrue(media["cache_hit"])
+            self.assertEqual(media["mime"], "image/gif")
             self.assertEqual(media["width"], 300)
             self.assertEqual(media["height"], 304)
             self.assertTrue(media["path"].startswith("chat_assets/stickers/"))
