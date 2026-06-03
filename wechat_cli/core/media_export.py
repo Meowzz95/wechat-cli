@@ -1,0 +1,602 @@
+"""Media asset helpers for self-contained chat exports."""
+
+import hashlib
+import json
+import mimetypes
+import os
+import posixpath
+import re
+import shutil
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+
+SCHEMA_VERSION = "wechat-cli.chat_export.v1"
+
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_IMAGE_SIGNATURES = [
+    ("jpg", "image/jpeg", bytes.fromhex("ffd8ff")),
+    ("png", "image/png", bytes.fromhex("89504e470d0a1a0a")),
+    ("gif", "image/gif", b"GIF8"),
+]
+_BMP_SIGNATURE = ("bmp", "image/bmp", b"BM")
+_WECHAT_V1_DAT_HEADER = b"\x07\x08V1"
+_WECHAT_V2_DAT_HEADER = b"\x07\x08V2"
+_WECHAT_DAT_HEADERS = (_WECHAT_V1_DAT_HEADER, _WECHAT_V2_DAT_HEADER)
+_WECHAT_V1_AES_KEY = b"cfcd208495d565ef"
+_WXGF_SIGNATURE = b"wxgf"
+_KVCOMM_STATISTIC_RE = re.compile(r"^(?:key_(?:reportnow_)?)?(\d+)_.*\.statistic$")
+_HEX32_RE = re.compile(r"^[a-fA-F0-9]{32}$")
+_V2_KEY_CACHE = {}
+
+
+def asset_dir_for_output(output_path):
+    base, _ = os.path.splitext(os.path.abspath(output_path))
+    return f"{base}_assets"
+
+
+def prepare_export_targets(output_path, assets_dir, overwrite=False):
+    output_path = os.path.abspath(output_path)
+    assets_dir = os.path.abspath(assets_dir)
+    if os.path.isdir(output_path):
+        raise ValueError(f"--output 必须是文件路径，不能是目录: {output_path}")
+
+    existing = []
+    if os.path.exists(output_path):
+        existing.append(output_path)
+    if os.path.exists(assets_dir):
+        existing.append(assets_dir)
+    if existing and not overwrite:
+        raise FileExistsError("导出目标已存在，请使用 --overwrite: " + ", ".join(existing))
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if overwrite:
+        if os.path.isfile(output_path):
+            os.unlink(output_path)
+        elif os.path.exists(output_path):
+            raise ValueError(f"无法覆盖非文件输出路径: {output_path}")
+        if os.path.isdir(assets_dir):
+            shutil.rmtree(assets_dir)
+        elif os.path.exists(assets_dir):
+            os.unlink(assets_dir)
+    os.makedirs(assets_dir, exist_ok=True)
+
+
+def build_export_payload(chat_ctx, records, start_time="", end_time="", limit=None, failures=None, warnings=None):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "chat": {
+            "name": chat_ctx["display_name"],
+            "username": chat_ctx["username"],
+            "is_group": bool(chat_ctx["is_group"]),
+        },
+        "range": {
+            "start_time": start_time or None,
+            "end_time": end_time or None,
+        },
+        "limit": limit,
+        "count": len(records),
+        "messages": records,
+        "warnings": warnings or [],
+        "failures": failures or [],
+    }
+
+
+def write_json_export(payload, output_path):
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def materialize_record_media(records, assets_dir, output_path):
+    warnings = []
+    rel_assets_root = os.path.relpath(assets_dir, os.path.dirname(os.path.abspath(output_path)) or ".")
+    rel_assets_root = _to_posix(rel_assets_root)
+    used_names = set()
+
+    for record in records:
+        sources = record.pop("_media_sources", [])
+        media_entries = []
+        for index, source in enumerate(sources):
+            entry = _materialize_source(source, record, index, assets_dir, rel_assets_root, used_names)
+            media_entries.append(entry)
+            if entry["status"] != "copied" and entry["status"] != "decoded":
+                warnings.append({
+                    "local_id": record.get("local_id"),
+                    "kind": entry.get("kind"),
+                    "status": entry.get("status"),
+                    "detail": entry.get("detail", ""),
+                })
+        record["media"] = media_entries
+    return warnings
+
+
+def _materialize_source(source, record, index, assets_dir, rel_assets_root, used_names):
+    kind = source.get("kind", "file")
+    source_path = source.get("source_path")
+    if not source_path or not os.path.exists(source_path):
+        return _media_status_entry(source, "missing", detail=source.get("detail") or "local media file not found")
+
+    try:
+        if kind == "image":
+            return _materialize_image(source, record, index, assets_dir, rel_assets_root, used_names)
+        return _copy_source(source, record, index, assets_dir, rel_assets_root, used_names, status="copied")
+    except OSError as e:
+        return _media_status_entry(source, "missing", detail=str(e))
+
+
+def _materialize_image(source, record, index, assets_dir, rel_assets_root, used_names):
+    source_path = source["source_path"]
+    original_is_wechat_dat = False
+    candidate_paths = [source_path] + _image_variant_paths(source_path)
+    for candidate_path in candidate_paths:
+        with open(candidate_path, "rb") as f:
+            data = f.read()
+        if candidate_path == source_path:
+            original_is_wechat_dat = _is_wechat_dat(data)
+
+        candidate_source = dict(source)
+        candidate_source["source_path"] = candidate_path
+        if candidate_path != source_path:
+            candidate_source["original_filename"] = os.path.basename(candidate_path)
+
+        detected = detect_image_bytes(data)
+        if detected:
+            ext, mime = detected
+            return _write_asset_bytes(
+                data, candidate_source, record, index, assets_dir, rel_assets_root, used_names,
+                ext=ext, mime=mime, status="copied",
+            )
+
+        decoded = decode_wechat_image_dat(data, source_path=candidate_path)
+        if decoded:
+            decoded_data, ext, mime = decoded
+            return _write_asset_bytes(
+                decoded_data, candidate_source, record, index, assets_dir, rel_assets_root, used_names,
+                ext=ext, mime=mime, status="decoded",
+            )
+
+    detail = "WeChat image .dat could not be decoded" if original_is_wechat_dat else "image .dat could not be decoded"
+    return _copy_source(
+        source, record, index, assets_dir, rel_assets_root, used_names,
+        status="undecodable", detail=detail,
+    )
+
+
+def _copy_source(source, record, index, assets_dir, rel_assets_root, used_names, status, detail=""):
+    source_path = source["source_path"]
+    ext = _extension_for_source(source_path, source.get("kind", "file"))
+    mime = mimetypes.guess_type(source_path)[0] or _default_mime(source.get("kind", "file"))
+    rel_path, dest_path = _destination_paths(
+        source, record, index, assets_dir, rel_assets_root, used_names, ext
+    )
+    shutil.copy2(source_path, dest_path)
+    return _media_file_entry(source, status, rel_path, dest_path, mime=mime, detail=detail)
+
+
+def _write_asset_bytes(data, source, record, index, assets_dir, rel_assets_root, used_names, ext, mime, status):
+    rel_path, dest_path = _destination_paths(
+        source, record, index, assets_dir, rel_assets_root, used_names, ext
+    )
+    with open(dest_path, "wb") as f:
+        f.write(data)
+    return _media_file_entry(source, status, rel_path, dest_path, mime=mime)
+
+
+def _destination_paths(source, record, index, assets_dir, rel_assets_root, used_names, ext):
+    kind = source.get("kind", "file")
+    subdir = {
+        "image": "images",
+        "video": "videos",
+        "voice": "audio",
+        "audio": "audio",
+        "file": "files",
+    }.get(kind, "media")
+    safe_base = _safe_asset_basename(source, record, index)
+    filename = f"{safe_base}.{ext.lstrip('.')}" if ext else safe_base
+    filename = _unique_name(used_names, subdir, filename)
+    dest_dir = os.path.join(assets_dir, subdir)
+    os.makedirs(dest_dir, exist_ok=True)
+    rel_path = posixpath.join(rel_assets_root, subdir, filename)
+    return rel_path, os.path.join(dest_dir, filename)
+
+
+def _safe_asset_basename(source, record, index):
+    created = record.get("time") or ""
+    created = created.replace(":", "").replace("-", "").replace(" ", "_")
+    local_id = record.get("local_id", "message")
+    original = source.get("original_filename") or ""
+    original = os.path.splitext(os.path.basename(original))[0]
+    parts = [str(created or "time"), str(local_id), str(index)]
+    if original:
+        parts.append(original[:60])
+    raw = "_".join(parts)
+    safe = _SAFE_NAME_RE.sub("_", raw).strip("._")
+    return safe or f"media_{local_id}_{index}"
+
+
+def _unique_name(used_names, subdir, filename):
+    key = (subdir, filename)
+    if key not in used_names:
+        used_names.add(key)
+        return filename
+    base, ext = os.path.splitext(filename)
+    i = 1
+    while True:
+        candidate = f"{base}_{i}{ext}"
+        key = (subdir, candidate)
+        if key not in used_names:
+            used_names.add(key)
+            return candidate
+        i += 1
+
+
+def _extension_for_source(path, kind):
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    if ext:
+        return ext
+    return {
+        "image": "dat",
+        "video": "mp4",
+        "voice": "aud",
+        "audio": "aud",
+        "file": "bin",
+    }.get(kind, "bin")
+
+
+def _default_mime(kind):
+    return {
+        "image": "application/octet-stream",
+        "video": "video/mp4",
+        "voice": "application/octet-stream",
+        "audio": "application/octet-stream",
+        "file": "application/octet-stream",
+    }.get(kind, "application/octet-stream")
+
+
+def _media_status_entry(source, status, detail=""):
+    entry = {
+        "kind": source.get("kind", "file"),
+        "status": status,
+    }
+    if source.get("original_filename"):
+        entry["original_filename"] = source["original_filename"]
+    if detail:
+        entry["detail"] = detail
+    return entry
+
+
+def _media_file_entry(source, status, rel_path, dest_path, mime=None, detail=""):
+    entry = _media_status_entry(source, status, detail=detail)
+    entry["path"] = rel_path
+    entry["mime"] = mime or "application/octet-stream"
+    try:
+        entry["bytes"] = os.path.getsize(dest_path)
+    except OSError:
+        pass
+    return entry
+
+
+def detect_image_bytes(data):
+    for ext, mime, signature in _IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return ext, mime
+    if _is_valid_bmp(data):
+        return _BMP_SIGNATURE[0], _BMP_SIGNATURE[1]
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    return None
+
+
+def decode_wechat_image_dat(data, source_path=None):
+    if not data:
+        return None
+    if is_wxgf_image(data):
+        return decode_wxgf_image(data)
+    if _is_wechat_v2_dat(data):
+        return _decode_wechat_v2_image_dat(data, source_path)
+    if _is_wechat_v1_dat(data):
+        decoded = _decode_wechat_segmented_dat(data, _WECHAT_V1_AES_KEY, 0)
+        if decoded:
+            detected = detect_image_bytes(decoded)
+            if detected:
+                ext, mime = detected
+                return decoded, ext, mime
+        return None
+
+    for ext, mime, signature in _IMAGE_SIGNATURES + [_BMP_SIGNATURE]:
+        key = data[0] ^ signature[0]
+        prefix = _xor_prefix(data, key, len(signature))
+        if prefix == signature:
+            decoded = bytes(b ^ key for b in data)
+            detected = detect_image_bytes(decoded)
+            if detected:
+                detected_ext, detected_mime = detected
+                return decoded, detected_ext, detected_mime
+
+    # WEBP uses RIFF....WEBP, so validate both fixed signature positions.
+    webp_header = b"RIFF"
+    key = data[0] ^ webp_header[0]
+    if len(data) >= 12:
+        decoded_prefix = _xor_prefix(data, key, 12)
+        if decoded_prefix.startswith(b"RIFF") and decoded_prefix[8:12] == b"WEBP":
+            decoded = bytes(b ^ key for b in data)
+            return decoded, "webp", "image/webp"
+    return None
+
+
+def _image_variant_paths(path):
+    directory = os.path.dirname(path)
+    filename = os.path.basename(path)
+    stem, ext = os.path.splitext(filename)
+    if ext.lower() != ".dat":
+        return []
+
+    base_stem = stem
+    if stem.endswith("_h") or stem.endswith("_t"):
+        base_stem = stem[:-2]
+    if not _HEX32_RE.fullmatch(base_stem):
+        return []
+
+    candidate_names = [
+        f"{base_stem}_h.dat",
+        f"{base_stem}.dat",
+        f"{base_stem}_t.dat",
+    ]
+    candidates = []
+    seen = {os.path.abspath(path)}
+    for candidate_name in candidate_names:
+        candidate_path = os.path.abspath(os.path.join(directory, candidate_name))
+        if candidate_path in seen:
+            continue
+        seen.add(candidate_path)
+        if os.path.isfile(candidate_path):
+            candidates.append(candidate_path)
+    return candidates
+
+
+def _is_wechat_dat(data):
+    return any(data.startswith(header) for header in _WECHAT_DAT_HEADERS)
+
+
+def _is_wechat_v1_dat(data):
+    return data.startswith(_WECHAT_V1_DAT_HEADER)
+
+
+def _is_wechat_v2_dat(data):
+    return data.startswith(_WECHAT_V2_DAT_HEADER)
+
+
+def _decode_wechat_v2_image_dat(data, source_path):
+    for aes_key, xor_key in _wechat_v2_key_candidates(source_path):
+        decoded = _decode_wechat_segmented_dat(data, aes_key, xor_key)
+        if not decoded:
+            continue
+        detected = detect_image_bytes(decoded)
+        if detected:
+            ext, mime = detected
+            return decoded, ext, mime
+        if is_wxgf_image(decoded):
+            wxgf_decoded = decode_wxgf_image(decoded)
+            if wxgf_decoded:
+                return wxgf_decoded
+    return None
+
+
+def is_wxgf_image(data):
+    return len(data) >= 15 and data.startswith(_WXGF_SIGNATURE)
+
+
+def decode_wxgf_image(data):
+    partition = _largest_wxgf_partition(data)
+    if not partition:
+        return None
+    ffmpeg_path = _ffmpeg_path()
+    if not ffmpeg_path:
+        return None
+
+    start, size = partition
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel", "error",
+                "-f", "hevc",
+                "-i", "pipe:0",
+                "-frames:v", "1",
+                "-c:v", "mjpeg",
+                "-q:v", "4",
+                "-f", "image2",
+                "pipe:1",
+            ],
+            input=data[start:start + size],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if completed.returncode != 0 or not completed.stdout:
+        return None
+    detected = detect_image_bytes(completed.stdout)
+    if not detected:
+        return None
+    ext, mime = detected
+    return completed.stdout, ext, mime
+
+
+def _largest_wxgf_partition(data):
+    if not is_wxgf_image(data):
+        return None
+    header_len = data[4]
+    if header_len >= len(data):
+        return None
+
+    best = None
+    for pattern in (b"\x00\x00\x00\x01", b"\x00\x00\x01"):
+        offset = 0
+        while header_len + offset <= len(data):
+            index = data.find(pattern, header_len + offset)
+            if index == -1:
+                break
+            if index >= 4:
+                size = int.from_bytes(data[index - 4:index], "big")
+                if size > 0 and index + size <= len(data):
+                    if best is None or size > best[1]:
+                        best = (index, size)
+                    offset = index - header_len + size
+                    continue
+            offset = index - header_len + 1
+        if best:
+            return best
+    return None
+
+
+def _ffmpeg_path():
+    configured = os.environ.get("FFMPEG_PATH")
+    if configured:
+        return configured if os.path.isfile(configured) or shutil.which(configured) else None
+    return shutil.which("ffmpeg")
+
+
+def _decode_wechat_segmented_dat(data, aes_key, xor_key):
+    if len(data) < 15:
+        return None
+    aes_len = int.from_bytes(data[6:10], "little")
+    xor_len = int.from_bytes(data[10:14], "little")
+    body = data[15:]
+    aes_cipher_len = (aes_len // 16) * 16 + 16
+    if aes_cipher_len > len(body) or xor_len > len(body) or len(body) - xor_len < aes_cipher_len:
+        return None
+
+    try:
+        from Crypto.Cipher import AES
+        prefix = AES.new(aes_key, AES.MODE_ECB).decrypt(body[:aes_cipher_len])[:aes_len]
+    except (ImportError, ValueError):
+        return None
+
+    middle_end = len(body) - xor_len
+    middle = body[aes_cipher_len:middle_end]
+    tail = bytes(b ^ xor_key for b in body[middle_end:]) if xor_len else b""
+    return prefix + middle + tail
+
+
+def _wechat_v2_key_candidates(source_path):
+    if not source_path:
+        return []
+    context = _wechat_media_context(source_path)
+    if not context:
+        return []
+    documents_dir, account_dir, wxid = context
+    cache_key = (documents_dir, account_dir)
+    if cache_key in _V2_KEY_CACHE:
+        return _V2_KEY_CACHE[cache_key]
+
+    candidates = []
+    seen_uins = set()
+    for uin in _kvcomm_uins(documents_dir):
+        if uin in seen_uins:
+            continue
+        seen_uins.add(uin)
+        aes_key = hashlib.md5((str(uin) + wxid).encode("utf-8")).hexdigest()[:16].encode("ascii")
+        candidates.append((aes_key, uin & 0xff))
+    _V2_KEY_CACHE[cache_key] = candidates
+    return candidates
+
+
+def _wechat_media_context(source_path):
+    try:
+        path = Path(source_path).resolve()
+        parts = path.parts
+        idx = parts.index("xwechat_files")
+        account_dir = parts[idx + 1]
+    except (ValueError, IndexError, OSError):
+        return None
+
+    wxid = account_dir
+    if "_" in account_dir:
+        prefix, suffix = account_dir.rsplit("_", 1)
+        if len(suffix) == 4 and all(c in "0123456789abcdefABCDEF" for c in suffix):
+            wxid = prefix
+    documents_dir = str(Path(*parts[:idx]))
+    return documents_dir, account_dir, wxid
+
+
+def _kvcomm_uins(documents_dir):
+    roots = [
+        os.path.join(documents_dir, "app_data", "net", "kvcomm"),
+        os.path.join(documents_dir, "app_data", "ilink", "kvcomm"),
+    ]
+    uins = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            filenames = os.listdir(root)
+        except OSError:
+            continue
+        for filename in filenames:
+            match = _KVCOMM_STATISTIC_RE.match(filename)
+            if not match:
+                continue
+            try:
+                uins.append(int(match.group(1)))
+            except ValueError:
+                continue
+    return uins
+
+
+def _is_valid_bmp(data):
+    if len(data) < 26 or not data.startswith(b"BM"):
+        return False
+
+    file_size = int.from_bytes(data[2:6], "little")
+    pixel_offset = int.from_bytes(data[10:14], "little")
+    dib_size = int.from_bytes(data[14:18], "little")
+    if dib_size not in {12, 40, 52, 56, 64, 108, 124}:
+        return False
+
+    min_header_size = 14 + dib_size
+    if len(data) < min_header_size:
+        return False
+    if file_size and (file_size < min_header_size or file_size > len(data)):
+        return False
+    if pixel_offset < min_header_size or pixel_offset > len(data):
+        return False
+
+    if dib_size == 12:
+        if len(data) < 26:
+            return False
+        width = int.from_bytes(data[18:20], "little")
+        height = int.from_bytes(data[20:22], "little")
+        planes = int.from_bytes(data[22:24], "little")
+        bit_count = int.from_bytes(data[24:26], "little")
+    else:
+        if len(data) < 30:
+            return False
+        width = int.from_bytes(data[18:22], "little", signed=True)
+        height = int.from_bytes(data[22:26], "little", signed=True)
+        planes = int.from_bytes(data[26:28], "little")
+        bit_count = int.from_bytes(data[28:30], "little")
+
+    return (
+        width > 0
+        and height != 0
+        and abs(height) <= 100000
+        and width <= 100000
+        and planes == 1
+        and bit_count in {1, 4, 8, 16, 24, 32}
+    )
+
+
+def _xor_prefix(data, key, length):
+    return bytes(b ^ key for b in data[:length])
+
+
+def _to_posix(path):
+    return path.replace(os.sep, "/")
