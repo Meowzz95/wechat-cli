@@ -11,6 +11,8 @@ from ..core.media_export import (
     build_export_payload,
     materialize_record_media,
     prepare_export_targets,
+    readme_path_for_output,
+    write_export_readme,
     write_json_export,
 )
 from ..core.messages import (
@@ -69,8 +71,9 @@ def export(ctx, chat_name, fmt, output_path, start_time, end_time, limit, overwr
     if fmt == "json":
         output_path_abs = os.path.abspath(output_path)
         assets_dir = asset_dir_for_output(output_path_abs)
+        readme_path = readme_path_for_output(output_path_abs)
         try:
-            prepare_export_targets(output_path_abs, assets_dir, overwrite=overwrite)
+            prepare_export_targets(output_path_abs, assets_dir, readme_path=readme_path, overwrite=overwrite)
         except (FileExistsError, ValueError) as e:
             click.echo(f"错误: {e}", err=True)
             ctx.exit(2)
@@ -95,7 +98,8 @@ def export(ctx, chat_name, fmt, output_path, start_time, end_time, limit, overwr
             failures=failures, warnings=warnings,
         )
         write_json_export(payload, output_path_abs)
-        click.echo(f"已导出到: {output_path_abs}（{len(records)} 条消息，资产目录: {assets_dir}）", err=True)
+        write_export_readme(payload, output_path_abs, assets_dir, readme_path)
+        click.echo(f"已导出到: {output_path_abs}（{len(records)} 条消息，资产目录: {assets_dir}，说明: {readme_path}）", err=True)
         return
 
     text_limit = limit if limit is not None else 500

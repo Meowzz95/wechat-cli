@@ -18,6 +18,7 @@ from wechat_cli.core.media_export import (
     detect_image_bytes,
     materialize_record_media,
     prepare_export_targets,
+    readme_path_for_output,
 )
 from wechat_cli.core.messages import collect_chat_export_records
 
@@ -397,14 +398,18 @@ class JsonExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_path = os.path.join(tmp, "chat.json")
             assets_dir = os.path.join(tmp, "chat_assets")
+            readme_path = os.path.join(tmp, "chat_export_readme.md")
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write("{}")
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write("stale")
 
             with self.assertRaises(FileExistsError):
-                prepare_export_targets(output_path, assets_dir, overwrite=False)
+                prepare_export_targets(output_path, assets_dir, readme_path=readme_path, overwrite=False)
 
-            prepare_export_targets(output_path, assets_dir, overwrite=True)
+            prepare_export_targets(output_path, assets_dir, readme_path=readme_path, overwrite=True)
             self.assertFalse(os.path.exists(output_path))
+            self.assertFalse(os.path.exists(readme_path))
             self.assertTrue(os.path.isdir(assets_dir))
 
     def test_collect_chat_export_records_returns_all_messages_by_default_and_missing_media(self):
@@ -505,6 +510,7 @@ class JsonExportTests(unittest.TestCase):
             ])
             fake_app = FakeApp(db_dir, message_db)
             output_path = os.path.join(tmp, "chat.json")
+            readme_path = readme_path_for_output(output_path)
 
             runner = CliRunner()
             with patch.object(main, "AppContext", return_value=fake_app):
@@ -525,6 +531,13 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(media["status"], "decoded")
             self.assertTrue(media["path"].startswith("chat_assets/images/"))
             self.assertTrue(os.path.exists(os.path.join(tmp, media["path"])))
+            self.assertTrue(os.path.exists(readme_path))
+            with open(readme_path, encoding="utf-8") as f:
+                readme = f.read()
+            self.assertIn("# WeChat JSON Export", readme)
+            self.assertIn("schema_version`: `wechat-cli.chat_export.v1`", readme)
+            self.assertIn("Resolve every `media[].path` relative to the directory containing `chat.json`.", readme)
+            self.assertIn("`chat_assets/images/`", readme)
 
             with patch.object(main, "AppContext", return_value=fake_app):
                 blocked = runner.invoke(main.cli, [
