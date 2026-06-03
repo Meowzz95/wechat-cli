@@ -8,6 +8,9 @@ import posixpath
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +31,16 @@ _WECHAT_V1_AES_KEY = b"cfcd208495d565ef"
 _WXGF_SIGNATURE = b"wxgf"
 _KVCOMM_STATISTIC_RE = re.compile(r"^(?:key_(?:reportnow_)?)?(\d+)_.*\.statistic$")
 _HEX32_RE = re.compile(r"^[a-fA-F0-9]{32}$")
+_SUCCESS_MEDIA_STATUSES = {"copied", "decoded", "downloaded"}
+_MAX_STICKER_DOWNLOAD_BYTES = 100 * 1024 * 1024
+_STICKER_DOWNLOAD_HEADERS = {
+    "User-Agent": "MicroMessenger Client",
+    "Accept": "*/*",
+    "Cache-Control": "no-cache",
+    "Connection": "Keep-Alive",
+    "Content-Type": "application/octet-stream",
+    "X-Client-Os": "macOS",
+}
 _V2_KEY_CACHE = {}
 
 
@@ -148,8 +161,8 @@ Resolve every `media[].path` relative to the directory containing `{output_name}
 
 Common fields:
 
-- `kind`: `image`, `video`, `voice`, `audio`, `file`, or `media`.
-- `status`: `decoded`, `copied`, `missing`, or `undecodable`.
+- `kind`: `image`, `sticker`, `video`, `voice`, `audio`, `file`, or `media`.
+- `status`: `decoded`, `copied`, `downloaded`, `missing`, or `undecodable`.
 - `path`: relative asset path, present when a file was written.
 - `mime`: MIME type for written assets when known.
 - `bytes`: written asset size in bytes when available.
@@ -160,12 +173,14 @@ Status meaning:
 
 - `decoded`: WeChat-specific media was converted to a common format. Consumers can open the file directly.
 - `copied`: the original local file was copied as-is.
+- `downloaded`: a sticker/media asset was fetched from a WeChat CDN URL embedded in the message.
 - `missing`: the media reference was present but no local file was found.
 - `undecodable`: a local file was copied, but it could not be converted to a common format.
 
 ## Asset Folders
 
 - `{assets_rel}/images/`: image assets, usually JPG/PNG/GIF/WebP/BMP.
+- `{assets_rel}/stickers/`: sticker/emoticon assets, usually GIF/PNG/WebP.
 - `{assets_rel}/videos/`: video assets.
 - `{assets_rel}/audio/`: voice/audio assets.
 - `{assets_rel}/files/`: file attachments.
@@ -190,19 +205,23 @@ Status meaning:
         f.write(content)
 
 
-def materialize_record_media(records, assets_dir, output_path):
+def materialize_record_media(records, assets_dir, output_path, download_stickers=False):
     warnings = []
     rel_assets_root = os.path.relpath(assets_dir, os.path.dirname(os.path.abspath(output_path)) or ".")
     rel_assets_root = _to_posix(rel_assets_root)
     used_names = set()
+    sticker_cache = {}
 
     for record in records:
         sources = record.pop("_media_sources", [])
         media_entries = []
         for index, source in enumerate(sources):
-            entry = _materialize_source(source, record, index, assets_dir, rel_assets_root, used_names)
+            entry = _materialize_source(
+                source, record, index, assets_dir, rel_assets_root, used_names,
+                download_stickers=download_stickers, sticker_cache=sticker_cache,
+            )
             media_entries.append(entry)
-            if entry["status"] != "copied" and entry["status"] != "decoded":
+            if entry["status"] not in _SUCCESS_MEDIA_STATUSES:
                 warnings.append({
                     "local_id": record.get("local_id"),
                     "kind": entry.get("kind"),
@@ -213,9 +232,17 @@ def materialize_record_media(records, assets_dir, output_path):
     return warnings
 
 
-def _materialize_source(source, record, index, assets_dir, rel_assets_root, used_names):
+def _materialize_source(
+    source, record, index, assets_dir, rel_assets_root, used_names,
+    download_stickers=False, sticker_cache=None,
+):
     kind = source.get("kind", "file")
     source_path = source.get("source_path")
+    if kind == "sticker":
+        return _materialize_sticker(
+            source, record, index, assets_dir, rel_assets_root, used_names,
+            download_stickers=download_stickers, sticker_cache=sticker_cache,
+        )
     if not source_path or not os.path.exists(source_path):
         return _media_status_entry(source, "missing", detail=source.get("detail") or "local media file not found")
 
@@ -265,6 +292,214 @@ def _materialize_image(source, record, index, assets_dir, rel_assets_root, used_
     )
 
 
+def _materialize_sticker(
+    source, record, index, assets_dir, rel_assets_root, used_names,
+    download_stickers=False, sticker_cache=None,
+):
+    sticker_cache = sticker_cache if sticker_cache is not None else {}
+    cached_entry = _cached_sticker_entry(sticker_cache, source)
+    if cached_entry:
+        return cached_entry
+
+    source_path = source.get("source_path")
+    local_error = ""
+    if source_path and os.path.exists(source_path):
+        local_result = _try_materialize_sticker_bytes(
+            source, record, index, assets_dir, rel_assets_root, used_names
+        )
+        if local_result:
+            return _cache_sticker_entry(sticker_cache, source, local_result)
+        local_error = "local sticker cache could not be decoded"
+
+    download_errors = []
+    if download_stickers:
+        downloaded = _download_sticker_asset(
+            source, record, index, assets_dir, rel_assets_root, used_names, download_errors
+        )
+        if downloaded:
+            return _cache_sticker_entry(sticker_cache, source, downloaded)
+
+    if source_path and os.path.exists(source_path):
+        detail = local_error
+        if download_errors:
+            detail += "; " + "; ".join(download_errors)
+        return _copy_source(
+            _with_source_label(source, "local_cache"),
+            record, index, assets_dir, rel_assets_root, used_names,
+            status="undecodable", detail=detail,
+        )
+
+    if not download_stickers and (source.get("cdn_url") or source.get("encrypt_url")):
+        detail = "sticker CDN download disabled; pass --download-stickers to export it"
+    elif download_errors:
+        detail = "; ".join(download_errors)
+    else:
+        detail = source.get("detail") or "local sticker cache not found"
+    return _media_status_entry(source, "missing", detail=detail)
+
+
+def _try_materialize_sticker_bytes(source, record, index, assets_dir, rel_assets_root, used_names):
+    source_path = source.get("source_path")
+    try:
+        with open(source_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+
+    detected = detect_image_bytes(data)
+    if detected and _sticker_md5_matches(data, source):
+        ext, mime = detected
+        return _write_asset_bytes(
+            data, _with_source_label(source, "local_cache"), record, index,
+            assets_dir, rel_assets_root, used_names, ext=ext, mime=mime, status="copied",
+        )
+
+    decoded = decode_wechat_image_dat(data, source_path=source_path)
+    if decoded and _sticker_md5_matches(decoded[0], source):
+        decoded_data, ext, mime = decoded
+        return _write_asset_bytes(
+            decoded_data, _with_source_label(source, "local_cache"), record, index,
+            assets_dir, rel_assets_root, used_names, ext=ext, mime=mime, status="decoded",
+        )
+
+    decoded = _decode_sticker_aes_cbc(data, source)
+    if decoded:
+        decoded_data, ext, mime = decoded
+        return _write_asset_bytes(
+            decoded_data, _with_source_label(source, "local_cache"), record, index,
+            assets_dir, rel_assets_root, used_names, ext=ext, mime=mime, status="decoded",
+        )
+    return None
+
+
+def _download_sticker_asset(source, record, index, assets_dir, rel_assets_root, used_names, errors):
+    cdn_url = source.get("cdn_url")
+    if cdn_url:
+        data, error = _download_url(cdn_url)
+        if data is None:
+            errors.append(f"cdnurl: {error}")
+        else:
+            detected = detect_image_bytes(data)
+            if detected and _sticker_md5_matches(data, source):
+                ext, mime = detected
+                return _write_asset_bytes(
+                    data, _with_source_label(source, "cdnurl"), record, index,
+                    assets_dir, rel_assets_root, used_names, ext=ext, mime=mime, status="downloaded",
+                )
+            errors.append("cdnurl: downloaded bytes did not match sticker image metadata")
+
+    encrypt_url = source.get("encrypt_url")
+    if encrypt_url:
+        data, error = _download_url(encrypt_url)
+        if data is None:
+            errors.append(f"encrypturl: {error}")
+        else:
+            decoded = _decode_sticker_aes_cbc(data, source)
+            if decoded:
+                decoded_data, ext, mime = decoded
+                return _write_asset_bytes(
+                    decoded_data, _with_source_label(source, "encrypturl"), record, index,
+                    assets_dir, rel_assets_root, used_names, ext=ext, mime=mime, status="decoded",
+                )
+            errors.append("encrypturl: encrypted bytes could not be decrypted to a matching image")
+    return None
+
+
+def _cached_sticker_entry(sticker_cache, source):
+    for key in _sticker_cache_keys(source):
+        cached = sticker_cache.get(key)
+        if cached:
+            return dict(cached)
+    return None
+
+
+def _cache_sticker_entry(sticker_cache, source, entry):
+    if entry.get("status") not in _SUCCESS_MEDIA_STATUSES or not entry.get("path"):
+        return entry
+    cached = dict(entry)
+    for key in _sticker_cache_keys(source):
+        sticker_cache.setdefault(key, cached)
+    return entry
+
+
+def _sticker_cache_keys(source):
+    keys = []
+    sticker_md5 = (source.get("sticker_md5") or "").strip().lower()
+    if sticker_md5:
+        keys.append(("md5", sticker_md5))
+    for field_name in ("cdn_url", "encrypt_url"):
+        value = (source.get(field_name) or "").strip()
+        if value:
+            keys.append((field_name, value))
+    source_path = source.get("source_path")
+    if source_path:
+        keys.append(("source_path", os.path.abspath(source_path)))
+    return keys
+
+
+def _download_url(url):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None, "unsupported URL"
+    try:
+        request = urllib.request.Request(url, headers=_STICKER_DOWNLOAD_HEADERS)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = response.read(_MAX_STICKER_DOWNLOAD_BYTES + 1)
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as e:
+        return None, str(e)
+    if len(data) > _MAX_STICKER_DOWNLOAD_BYTES:
+        return None, "download too large"
+    return data, ""
+
+
+def _decode_sticker_aes_cbc(data, source):
+    aeskey = (source.get("aeskey") or "").strip()
+    if not _HEX32_RE.fullmatch(aeskey) or len(data) % 16:
+        return None
+    try:
+        from Crypto.Cipher import AES
+        key = bytes.fromhex(aeskey)
+        decrypted = AES.new(key, AES.MODE_CBC, iv=key).decrypt(data)
+    except (ImportError, ValueError):
+        return None
+
+    candidates = []
+    unpadded = _pkcs7_unpad(decrypted)
+    if unpadded:
+        candidates.append(unpadded)
+    candidates.append(decrypted)
+    for candidate in candidates:
+        detected = detect_image_bytes(candidate)
+        if detected and _sticker_md5_matches(candidate, source):
+            ext, mime = detected
+            return candidate, ext, mime
+    return None
+
+
+def _pkcs7_unpad(data):
+    if not data:
+        return None
+    pad = data[-1]
+    if pad < 1 or pad > 16 or len(data) < pad:
+        return None
+    if data[-pad:] != bytes([pad]) * pad:
+        return None
+    return data[:-pad]
+
+
+def _sticker_md5_matches(data, source):
+    expected = (source.get("sticker_md5") or "").strip().lower()
+    if not expected:
+        return True
+    return hashlib.md5(data).hexdigest().lower() == expected
+
+
+def _with_source_label(source, label):
+    labeled = dict(source)
+    labeled["source_label"] = label
+    return labeled
+
+
 def _copy_source(source, record, index, assets_dir, rel_assets_root, used_names, status, detail=""):
     source_path = source["source_path"]
     ext = _extension_for_source(source_path, source.get("kind", "file"))
@@ -289,6 +524,7 @@ def _destination_paths(source, record, index, assets_dir, rel_assets_root, used_
     kind = source.get("kind", "file")
     subdir = {
         "image": "images",
+        "sticker": "stickers",
         "video": "videos",
         "voice": "audio",
         "audio": "audio",
@@ -339,6 +575,7 @@ def _extension_for_source(path, kind):
         return ext
     return {
         "image": "dat",
+        "sticker": "bin",
         "video": "mp4",
         "voice": "aud",
         "audio": "aud",
@@ -349,6 +586,7 @@ def _extension_for_source(path, kind):
 def _default_mime(kind):
     return {
         "image": "application/octet-stream",
+        "sticker": "application/octet-stream",
         "video": "video/mp4",
         "voice": "application/octet-stream",
         "audio": "application/octet-stream",
@@ -363,6 +601,18 @@ def _media_status_entry(source, status, detail=""):
     }
     if source.get("original_filename"):
         entry["original_filename"] = source["original_filename"]
+    if source.get("source_label"):
+        entry["source"] = source["source_label"]
+    for source_key, entry_key in (
+        ("sticker_md5", "md5"),
+        ("expected_bytes", "expected_bytes"),
+        ("width", "width"),
+        ("height", "height"),
+        ("product_id", "product_id"),
+    ):
+        value = source.get(source_key)
+        if value not in (None, ""):
+            entry[entry_key] = _json_scalar(value)
     if detail:
         entry["detail"] = detail
     return entry
@@ -696,6 +946,17 @@ def _is_valid_bmp(data):
 
 def _xor_prefix(data, key, length):
     return bytes(b ^ key for b in data[:length])
+
+
+def _json_scalar(value):
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            try:
+                return int(stripped)
+            except ValueError:
+                return value
+    return value
 
 
 def _to_posix(path):

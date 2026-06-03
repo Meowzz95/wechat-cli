@@ -33,8 +33,9 @@ from ..output.formatter import output
 @click.option("--end-time", default="", help="结束时间 YYYY-MM-DD [HH:MM[:SS]]")
 @click.option("--limit", default=None, type=int, help="导出消息数量（JSON 默认全部，markdown/txt 默认 500）")
 @click.option("--overwrite", is_flag=True, help="覆盖已存在的 JSON 输出文件和资产目录（仅 JSON）")
+@click.option("--download-stickers", is_flag=True, help="JSON 导出时从 WeChat CDN 下载/解密本地不可解码的表情")
 @click.pass_context
-def export(ctx, chat_name, fmt, output_path, start_time, end_time, limit, overwrite):
+def export(ctx, chat_name, fmt, output_path, start_time, end_time, limit, overwrite, download_stickers):
     """导出聊天记录为 markdown、纯文本或结构化 JSON
 
     \b
@@ -91,7 +92,9 @@ def export(ctx, chat_name, fmt, output_path, start_time, end_time, limit, overwr
             resource_db_path=resource_db_path,
         )
         failures = resource_failures + failures
-        warnings = materialize_record_media(records, assets_dir, output_path_abs)
+        warnings = materialize_record_media(
+            records, assets_dir, output_path_abs, download_stickers=download_stickers
+        )
         payload = build_export_payload(
             chat_ctx, records,
             start_time=start_time, end_time=end_time, limit=limit,

@@ -192,6 +192,24 @@ def _wxgf_with_partition(payload):
     return header + len(payload).to_bytes(4, "big") + payload
 
 
+def _gif_bytes():
+    return b"GIF89a" + b"\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+
+
+def _sticker_xml(sticker_md5, aeskey="5fd76e9a49304191ab82949d45931e89", cdnurl="https://example.test/cdn", encrypturl="https://example.test/encrypt"):
+    return (
+        '<msg><emoji type="2" '
+        f'md5="{sticker_md5}" len="{len(_gif_bytes())}" width="300" height="304" '
+        f'aeskey="{aeskey}" cdnurl="{cdnurl}" encrypturl="{encrypturl}" /></msg>'
+    )
+
+
+def _aes_cbc_pkcs7_encrypt(data, aeskey):
+    key = bytes.fromhex(aeskey)
+    pad = 16 - (len(data) % 16)
+    return AES.new(key, AES.MODE_CBC, iv=key).encrypt(data + bytes([pad]) * pad)
+
+
 class JsonExportTests(unittest.TestCase):
     def test_decode_wechat_image_dat_detects_xor_jpeg(self):
         jpeg = bytes.fromhex("ffd8ffe000104a464946") + b"payload"
@@ -394,6 +412,141 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(warnings[0]["status"], "missing")
             self.assertFalse(os.path.exists(assets_dir))
 
+    def test_materialize_sticker_downloads_cdn_gif(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gif = _gif_bytes()
+            sticker_md5 = hashlib.md5(gif).hexdigest()
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [{
+                "local_id": 47,
+                "time": "2026-06-03 10:18:00",
+                "_media_sources": [{
+                    "kind": "sticker",
+                    "original_filename": sticker_md5,
+                    "sticker_md5": sticker_md5,
+                    "expected_bytes": str(len(gif)),
+                    "width": "300",
+                    "height": "304",
+                    "cdn_url": "https://example.test/cdn",
+                }],
+            }]
+
+            with patch("wechat_cli.core.media_export._download_url", return_value=(gif, "")):
+                warnings = materialize_record_media(
+                    records, assets_dir, output_path, download_stickers=True
+                )
+
+            self.assertEqual(warnings, [])
+            media = records[0]["media"][0]
+            self.assertEqual(media["kind"], "sticker")
+            self.assertEqual(media["status"], "downloaded")
+            self.assertEqual(media["source"], "cdnurl")
+            self.assertEqual(media["mime"], "image/gif")
+            self.assertEqual(media["md5"], sticker_md5)
+            self.assertEqual(media["width"], 300)
+            self.assertEqual(media["height"], 304)
+            self.assertTrue(media["path"].startswith("chat_assets/stickers/"))
+            with open(os.path.join(tmp, media["path"]), "rb") as f:
+                self.assertEqual(f.read(), gif)
+
+    def test_materialize_sticker_reuses_downloaded_asset_by_md5(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gif = _gif_bytes()
+            sticker_md5 = hashlib.md5(gif).hexdigest()
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            source = {
+                "kind": "sticker",
+                "original_filename": sticker_md5,
+                "sticker_md5": sticker_md5,
+                "cdn_url": "https://example.test/cdn",
+            }
+            records = [
+                {
+                    "local_id": 47,
+                    "time": "2026-06-03 10:18:00",
+                    "_media_sources": [dict(source)],
+                },
+                {
+                    "local_id": 48,
+                    "time": "2026-06-03 10:19:00",
+                    "_media_sources": [dict(source)],
+                },
+            ]
+            calls = []
+
+            def fake_download(url):
+                calls.append(url)
+                return gif, ""
+
+            with patch("wechat_cli.core.media_export._download_url", side_effect=fake_download):
+                warnings = materialize_record_media(
+                    records, assets_dir, output_path, download_stickers=True
+                )
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(calls, ["https://example.test/cdn"])
+            first = records[0]["media"][0]
+            second = records[1]["media"][0]
+            self.assertEqual(first["path"], second["path"])
+            self.assertEqual(first["status"], "downloaded")
+            self.assertEqual(second["status"], "downloaded")
+
+    def test_materialize_sticker_decrypts_encrypturl_gif(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gif = _gif_bytes()
+            aeskey = "5fd76e9a49304191ab82949d45931e89"
+            sticker_md5 = hashlib.md5(gif).hexdigest()
+            encrypted = _aes_cbc_pkcs7_encrypt(gif, aeskey)
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [{
+                "local_id": 48,
+                "time": "2026-06-03 10:18:30",
+                "_media_sources": [{
+                    "kind": "sticker",
+                    "original_filename": sticker_md5,
+                    "sticker_md5": sticker_md5,
+                    "aeskey": aeskey,
+                    "encrypt_url": "https://example.test/encrypt",
+                }],
+            }]
+
+            with patch("wechat_cli.core.media_export._download_url", return_value=(encrypted, "")):
+                warnings = materialize_record_media(
+                    records, assets_dir, output_path, download_stickers=True
+                )
+
+            self.assertEqual(warnings, [])
+            media = records[0]["media"][0]
+            self.assertEqual(media["status"], "decoded")
+            self.assertEqual(media["source"], "encrypturl")
+            self.assertEqual(media["mime"], "image/gif")
+            with open(os.path.join(tmp, media["path"]), "rb") as f:
+                self.assertEqual(f.read(), gif)
+
+    def test_materialize_sticker_download_disabled_reports_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [{
+                "local_id": 49,
+                "time": "2026-06-03 10:19:00",
+                "_media_sources": [{
+                    "kind": "sticker",
+                    "original_filename": "missing-sticker",
+                    "cdn_url": "https://example.test/cdn",
+                }],
+            }]
+
+            warnings = materialize_record_media(records, assets_dir, output_path)
+
+            media = records[0]["media"][0]
+            self.assertEqual(media["status"], "missing")
+            self.assertIn("--download-stickers", media["detail"])
+            self.assertEqual(warnings[0]["kind"], "sticker")
+
     def test_prepare_export_targets_rejects_existing_without_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_path = os.path.join(tmp, "chat.json")
@@ -444,6 +597,46 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(records[1]["type"], "image")
             self.assertEqual(records[1]["_media_sources"][0]["kind"], "image")
             self.assertEqual(records[1]["_media_sources"][0]["source_path"], None)
+
+    def test_collect_chat_export_records_resolves_sticker_cache_and_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_dir = os.path.join(tmp, "xwechat", "db_storage")
+            os.makedirs(db_dir)
+            gif = _gif_bytes()
+            sticker_md5 = hashlib.md5(gif).hexdigest()
+            sticker_dir = os.path.join(tmp, "xwechat", "cache", "2026-06", "Emoticon", sticker_md5[:2])
+            os.makedirs(sticker_dir)
+            sticker_path = os.path.join(sticker_dir, sticker_md5)
+            with open(sticker_path, "wb") as f:
+                f.write(b"local-cache-wrapper")
+
+            message_db = os.path.join(tmp, "message.db")
+            ts = int(datetime(2026, 6, 3, 10, 0).timestamp())
+            xml = _sticker_xml(sticker_md5)
+            _write_sqlite(message_db, [(47, 47, ts, 1, f"alice:\n{xml}", None)])
+            app = FakeApp(db_dir, message_db)
+            ctx = {
+                "query": CHAT_USERNAME,
+                "username": CHAT_USERNAME,
+                "display_name": "Project Room",
+                "db_path": message_db,
+                "table_name": _table_name(),
+                "message_tables": [{"db_path": message_db, "table_name": _table_name()}],
+                "is_group": True,
+            }
+
+            records, failures = collect_chat_export_records(
+                ctx, {}, app.display_name_fn, limit=None, db_dir=db_dir
+            )
+
+            self.assertEqual(failures, [])
+            self.assertEqual(records[0]["type"], "sticker")
+            source = records[0]["_media_sources"][0]
+            self.assertEqual(source["kind"], "sticker")
+            self.assertEqual(source["source_path"], sticker_path)
+            self.assertEqual(source["sticker_md5"], sticker_md5)
+            self.assertEqual(source["cdn_url"], "https://example.test/cdn")
+            self.assertEqual(source["encrypt_url"], "https://example.test/encrypt")
 
     def test_collect_chat_export_records_uses_resource_hash_for_ambiguous_image(self):
         with tempfile.TemporaryDirectory() as tmp:

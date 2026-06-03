@@ -134,7 +134,20 @@ def _collapse_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 
+def _xml_payload(content):
+    if not content:
+        return content
+    text = content.strip()
+    if text.startswith("<"):
+        return text
+    start = text.find("<msg")
+    if start >= 0:
+        return text[start:]
+    return text
+
+
 def _parse_xml_root(content):
+    content = _xml_payload(content)
     if not content or len(content) > _XML_PARSE_MAX_LEN or _XML_UNSAFE_RE.search(content):
         return None
     try:
@@ -569,6 +582,23 @@ def _build_media_source(kind, source_path=None, original_filename='', detail='')
     }
 
 
+def _build_sticker_media_source(info, source_path=None, detail=''):
+    return {
+        'kind': 'sticker',
+        'source_path': source_path,
+        'original_filename': info.get('md5') or (os.path.basename(source_path) if source_path else ''),
+        'detail': detail,
+        'sticker_md5': info.get('md5', ''),
+        'expected_bytes': info.get('len', ''),
+        'width': info.get('width', ''),
+        'height': info.get('height', ''),
+        'product_id': info.get('productid', ''),
+        'aeskey': info.get('aeskey', ''),
+        'cdn_url': info.get('cdnurl', ''),
+        'encrypt_url': info.get('encrypturl', ''),
+    }
+
+
 def _resource_hashes_for_message(resource_index, local_id, base_type, create_time_ts):
     if not resource_index:
         return []
@@ -639,7 +669,43 @@ def _resolve_export_media_sources(db_dir, local_id, local_type, content, create_
         path, detail = _find_media_candidate(dirs, tokens=tokens)
         return [_build_media_source('voice', path, detail=detail)]
 
+    if base_type == 47:
+        info = _parse_sticker_info(content)
+        if not info:
+            return [_build_media_source('sticker', detail="sticker XML not found")]
+        path = _find_sticker_cache_path(wechat_base, date_prefix, info.get('md5'))
+        detail = "" if path else "local sticker cache not found"
+        return [_build_sticker_media_source(info, source_path=path, detail=detail)]
+
     return []
+
+
+def _parse_sticker_info(content):
+    root = _parse_xml_root(content)
+    if root is None:
+        return None
+    emoji = root.find('.//emoji')
+    if emoji is None:
+        return None
+    return {key: (emoji.attrib.get(key) or '').strip() for key in (
+        'md5', 'len', 'width', 'height', 'productid', 'aeskey', 'cdnurl', 'encrypturl'
+    )}
+
+
+def _find_sticker_cache_path(wechat_base, date_prefix, sticker_md5):
+    if not sticker_md5:
+        return None
+    prefix = sticker_md5[:2]
+    candidates = [
+        os.path.join(wechat_base, "cache", date_prefix, "Emoticon", prefix, sticker_md5),
+        os.path.join(wechat_base, "cache", date_prefix, "Emoticon", sticker_md5),
+        os.path.join(wechat_base, "business", "emoticon", "Persist", prefix, sticker_md5),
+        os.path.join(wechat_base, "business", "emoticon", "Thumb", prefix, f"{sticker_md5}.thumb"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def _extract_resource_hashes(packed_info):
