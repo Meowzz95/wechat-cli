@@ -708,6 +708,70 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(first["status"], "downloaded")
             self.assertEqual(second["status"], "downloaded")
 
+    def test_materialize_sticker_enriches_sparse_earlier_record_by_md5(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gif = _gif_bytes()
+            sticker_md5 = hashlib.md5(gif).hexdigest()
+            thumb_path = os.path.join(tmp, f"{sticker_md5}.thumb")
+            with open(thumb_path, "wb") as f:
+                f.write(b"wechat-local-thumb-wrapper")
+
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [
+                {
+                    "local_id": 11,
+                    "time": "2024-11-29 13:37:31",
+                    "_media_sources": [{
+                        "kind": "sticker",
+                        "source_path": thumb_path,
+                        "original_filename": sticker_md5,
+                        "sticker_md5": sticker_md5,
+                        "expected_bytes": "0",
+                        "width": "240",
+                        "height": "240",
+                    }],
+                },
+                {
+                    "local_id": 245,
+                    "time": "2024-12-09 17:15:05",
+                    "_media_sources": [{
+                        "kind": "sticker",
+                        "source_path": thumb_path,
+                        "original_filename": sticker_md5,
+                        "sticker_md5": sticker_md5,
+                        "expected_bytes": str(len(gif)),
+                        "width": "240",
+                        "height": "240",
+                        "product_id": "com.tencent.xin.emoticon.person.test",
+                        "cdn_url": "https://example.test/cdn",
+                    }],
+                },
+            ]
+            calls = []
+
+            def fake_download(url):
+                calls.append(url)
+                return gif, ""
+
+            with patch("wechat_cli.core.media_export._download_url", side_effect=fake_download):
+                warnings = materialize_record_media(
+                    records, assets_dir, output_path, download_stickers=True
+                )
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(calls, ["https://example.test/cdn"])
+            first = records[0]["media"][0]
+            second = records[1]["media"][0]
+            self.assertEqual(first["status"], "downloaded")
+            self.assertEqual(first["source"], "cdnurl")
+            self.assertEqual(first["mime"], "image/gif")
+            self.assertEqual(first["expected_bytes"], len(gif))
+            self.assertEqual(first["product_id"], "com.tencent.xin.emoticon.person.test")
+            self.assertEqual(first["path"], second["path"])
+            with open(os.path.join(tmp, first["path"]), "rb") as f:
+                self.assertEqual(f.read(), gif)
+
     def test_materialize_sticker_decrypts_encrypturl_gif(self):
         with tempfile.TemporaryDirectory() as tmp:
             gif = _gif_bytes()

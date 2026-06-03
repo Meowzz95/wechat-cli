@@ -219,6 +219,7 @@ def materialize_record_media(records, assets_dir, output_path, download_stickers
     used_names = set()
     sticker_cache = {}
 
+    _enrich_sticker_sources(records)
     for record in records:
         sources = record.pop("_media_sources", [])
         media_entries = []
@@ -246,6 +247,76 @@ def materialize_record_media(records, assets_dir, output_path, download_stickers
                 })
         record["media"] = media_entries
     return warnings
+
+
+def _enrich_sticker_sources(records):
+    best_by_md5 = {}
+    for record in records:
+        for source in record.get("_media_sources", []):
+            sticker_md5 = _sticker_md5(source)
+            if source.get("kind") != "sticker" or not sticker_md5:
+                continue
+            score = _sticker_source_enrichment_score(source)
+            if score <= 0:
+                continue
+            current = best_by_md5.get(sticker_md5)
+            if current is None or score > current[0]:
+                best_by_md5[sticker_md5] = (score, source)
+
+    if not best_by_md5:
+        return
+
+    for record in records:
+        for source in record.get("_media_sources", []):
+            sticker_md5 = _sticker_md5(source)
+            if source.get("kind") != "sticker" or not sticker_md5:
+                continue
+            rich_source = best_by_md5.get(sticker_md5)
+            if not rich_source:
+                continue
+            _merge_sticker_enrichment(source, rich_source[1])
+
+
+def _sticker_source_enrichment_score(source):
+    score = 0
+    if _has_sticker_value(source.get("cdn_url")):
+        score += 100
+    if _has_sticker_value(source.get("encrypt_url")) and _has_sticker_value(source.get("aeskey")):
+        score += 90
+    if _has_sticker_value(source.get("expected_bytes")):
+        score += 10
+    if _has_sticker_value(source.get("product_id")):
+        score += 2
+    if _has_sticker_value(source.get("width")):
+        score += 1
+    if _has_sticker_value(source.get("height")):
+        score += 1
+    return score
+
+
+def _merge_sticker_enrichment(target, source):
+    for field_name in (
+        "expected_bytes",
+        "width",
+        "height",
+        "product_id",
+        "aeskey",
+        "cdn_url",
+        "encrypt_url",
+    ):
+        if _has_sticker_value(target.get(field_name)):
+            continue
+        value = source.get(field_name)
+        if _has_sticker_value(value):
+            target[field_name] = value
+
+
+def _has_sticker_value(value):
+    if value in (None, ""):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip()) and value.strip() != "0"
+    return value != 0
 
 
 def _materialize_source(
