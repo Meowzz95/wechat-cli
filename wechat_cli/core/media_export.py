@@ -1,5 +1,6 @@
 """Media asset helpers for self-contained chat exports."""
 
+import base64
 import hashlib
 import json
 import mimetypes
@@ -166,6 +167,8 @@ Common fields:
 - `path`: relative asset path, present when a file was written.
 - `mime`: MIME type for written assets when known.
 - `bytes`: written asset size in bytes when available.
+- `width` / `height`: final exported visual asset dimensions in pixels when available.
+- `duration_ms`: final exported audio/video duration in milliseconds when available.
 - `original_filename`: source filename when available.
 - `detail`: warning/error detail for non-success statuses.
 
@@ -189,6 +192,7 @@ Status meaning:
 
 - Do not assume every message has media.
 - Do not assume every media entry has `path`; check `status` first.
+- Do not assume every media entry has dimensions or duration; check `width`, `height`, and `duration_ms`.
 - Treat `decoded` and `copied` as successful file outputs.
 - Preserve relative paths when moving the export; keep `{output_name}`, this readme, and `{assets_rel}/` together.
 
@@ -220,6 +224,7 @@ def materialize_record_media(records, assets_dir, output_path, download_stickers
                 source, record, index, assets_dir, rel_assets_root, used_names,
                 download_stickers=download_stickers, sticker_cache=sticker_cache,
             )
+            probe_warning = entry.pop("_probe_warning", "")
             media_entries.append(entry)
             if entry["status"] not in _SUCCESS_MEDIA_STATUSES:
                 warnings.append({
@@ -227,6 +232,13 @@ def materialize_record_media(records, assets_dir, output_path, download_stickers
                     "kind": entry.get("kind"),
                     "status": entry.get("status"),
                     "detail": entry.get("detail", ""),
+                })
+            elif probe_warning:
+                warnings.append({
+                    "local_id": record.get("local_id"),
+                    "kind": entry.get("kind"),
+                    "status": "metadata_unavailable",
+                    "detail": probe_warning,
                 })
         record["media"] = media_entries
     return warnings
@@ -417,6 +429,7 @@ def _cache_sticker_entry(sticker_cache, source, entry):
     if entry.get("status") not in _SUCCESS_MEDIA_STATUSES or not entry.get("path"):
         return entry
     cached = dict(entry)
+    cached.pop("_probe_warning", None)
     for key in _sticker_cache_keys(source):
         sticker_cache.setdefault(key, cached)
     return entry
@@ -626,7 +639,251 @@ def _media_file_entry(source, status, rel_path, dest_path, mime=None, detail="")
         entry["bytes"] = os.path.getsize(dest_path)
     except OSError:
         pass
+    if status in _SUCCESS_MEDIA_STATUSES:
+        metadata, warning = _probe_media_metadata(dest_path, entry)
+        entry.update(metadata)
+        if warning:
+            entry["_probe_warning"] = warning
     return entry
+
+
+def _probe_media_metadata(path, entry):
+    kind = entry.get("kind", "")
+    mime = entry.get("mime") or ""
+    if _expects_image_metadata(kind, mime):
+        metadata, detail = _probe_image_metadata(path)
+        missing = []
+        if not (metadata.get("width") or entry.get("width")):
+            missing.append("width")
+        if not (metadata.get("height") or entry.get("height")):
+            missing.append("height")
+        if missing:
+            return metadata, detail or f"image metadata unavailable: {', '.join(missing)}"
+        return metadata, ""
+
+    if _expects_av_metadata(kind, mime):
+        metadata, detail = _probe_ffprobe_metadata(path)
+        missing = []
+        if _expects_video_dimensions(kind, mime):
+            if not metadata.get("width"):
+                missing.append("width")
+            if not metadata.get("height"):
+                missing.append("height")
+        if not metadata.get("duration_ms"):
+            missing.append("duration_ms")
+        if missing:
+            return metadata, detail or f"audio/video metadata unavailable: {', '.join(missing)}"
+        return metadata, ""
+
+    return {}, ""
+
+
+def _expects_image_metadata(kind, mime):
+    return kind in {"image", "sticker"} or mime.startswith("image/")
+
+
+def _expects_av_metadata(kind, mime):
+    return kind in {"video", "voice", "audio"} or mime.startswith("video/") or mime.startswith("audio/")
+
+
+def _expects_video_dimensions(kind, mime):
+    return kind == "video" or mime.startswith("video/")
+
+
+def _probe_image_metadata(path):
+    pillow_error = ""
+    try:
+        from PIL import Image
+        with Image.open(path) as image:
+            width, height = image.size
+        if width and height:
+            return {"width": int(width), "height": int(height)}, ""
+    except ImportError:
+        pass
+    except Exception as e:
+        pillow_error = str(e)
+
+    metadata = _probe_image_metadata_from_header(path)
+    if metadata:
+        return metadata, ""
+    return {}, pillow_error or "image dimensions unavailable"
+
+
+def _probe_image_metadata_from_header(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(512 * 1024)
+    except OSError:
+        return {}
+    if len(data) < 10:
+        return {}
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        return _dimension_metadata(width, height)
+
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) >= 10:
+        width = int.from_bytes(data[6:8], "little")
+        height = int.from_bytes(data[8:10], "little")
+        return _dimension_metadata(width, height)
+
+    if _is_valid_bmp(data) and len(data) >= 26:
+        dib_size = int.from_bytes(data[14:18], "little")
+        if dib_size == 12:
+            width = int.from_bytes(data[18:20], "little")
+            height = int.from_bytes(data[20:22], "little")
+        else:
+            width = int.from_bytes(data[18:22], "little", signed=True)
+            height = int.from_bytes(data[22:26], "little", signed=True)
+        return _dimension_metadata(width, abs(height))
+
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return _probe_webp_dimensions(data)
+
+    if data.startswith(b"\xff\xd8"):
+        return _probe_jpeg_dimensions(data)
+
+    return {}
+
+
+def _probe_webp_dimensions(data):
+    if len(data) < 30:
+        return {}
+    chunk = data[12:16]
+    if chunk == b"VP8X" and len(data) >= 30:
+        width = int.from_bytes(data[24:27], "little") + 1
+        height = int.from_bytes(data[27:30], "little") + 1
+        return _dimension_metadata(width, height)
+    if chunk == b"VP8 " and len(data) >= 30:
+        width = int.from_bytes(data[26:28], "little") & 0x3fff
+        height = int.from_bytes(data[28:30], "little") & 0x3fff
+        return _dimension_metadata(width, height)
+    if chunk == b"VP8L" and len(data) >= 25:
+        bits = int.from_bytes(data[21:25], "little")
+        width = (bits & 0x3fff) + 1
+        height = ((bits >> 14) & 0x3fff) + 1
+        return _dimension_metadata(width, height)
+    return {}
+
+
+def _probe_jpeg_dimensions(data):
+    i = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while i + 9 <= len(data):
+        while i < len(data) and data[i] != 0xFF:
+            i += 1
+        while i < len(data) and data[i] == 0xFF:
+            i += 1
+        if i >= len(data):
+            return {}
+        marker = data[i]
+        i += 1
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if i + 2 > len(data):
+            return {}
+        segment_len = int.from_bytes(data[i:i + 2], "big")
+        if segment_len < 2 or i + segment_len > len(data):
+            return {}
+        if marker in sof_markers and segment_len >= 7:
+            height = int.from_bytes(data[i + 3:i + 5], "big")
+            width = int.from_bytes(data[i + 5:i + 7], "big")
+            return _dimension_metadata(width, height)
+        i += segment_len
+    return {}
+
+
+def _dimension_metadata(width, height):
+    if width and height and width > 0 and height > 0:
+        return {"width": int(width), "height": int(height)}
+    return {}
+
+
+def _probe_ffprobe_metadata(path):
+    ffprobe_path = _ffprobe_path()
+    if not ffprobe_path:
+        return {}, "ffprobe not found"
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe_path,
+                "-hide_banner",
+                "-loglevel", "error",
+                "-print_format", "json",
+                "-show_entries", "format=duration:stream=codec_type,width,height,duration",
+                path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {}, str(e)
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        return {}, detail or "ffprobe failed"
+    try:
+        payload = json.loads(completed.stdout.decode("utf-8", errors="replace") or "{}")
+    except json.JSONDecodeError as e:
+        return {}, f"ffprobe JSON parse failed: {e}"
+
+    metadata = {}
+    streams = payload.get("streams") or []
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    if video_stream:
+        width = _positive_int(video_stream.get("width"))
+        height = _positive_int(video_stream.get("height"))
+        if width:
+            metadata["width"] = width
+        if height:
+            metadata["height"] = height
+
+    duration_ms = _duration_ms((payload.get("format") or {}).get("duration"))
+    if duration_ms is None:
+        for stream in streams:
+            duration_ms = _duration_ms(stream.get("duration"))
+            if duration_ms is not None:
+                break
+    if duration_ms is not None:
+        metadata["duration_ms"] = duration_ms
+    return metadata, "" if metadata else "ffprobe returned no usable metadata"
+
+
+def _duration_ms(value):
+    if value in (None, "", "N/A"):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return int(round(seconds * 1000))
+
+
+def _positive_int(value):
+    try:
+        integer = int(value)
+    except (TypeError, ValueError):
+        return None
+    return integer if integer > 0 else None
+
+
+def _ffprobe_path():
+    configured = os.environ.get("FFPROBE_PATH")
+    if configured:
+        return configured if os.path.isfile(configured) or shutil.which(configured) else None
+    ffmpeg_configured = os.environ.get("FFMPEG_PATH")
+    if ffmpeg_configured and os.path.isfile(ffmpeg_configured):
+        candidate = os.path.join(os.path.dirname(ffmpeg_configured), "ffprobe")
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("ffprobe")
 
 
 def detect_image_bytes(data):
@@ -878,14 +1135,16 @@ def _wechat_media_context(source_path):
 
 
 def _kvcomm_uins(documents_dir):
-    roots = [
-        os.path.join(documents_dir, "app_data", "net", "kvcomm"),
-        os.path.join(documents_dir, "app_data", "ilink", "kvcomm"),
-    ]
+    roots = _kvcomm_roots(documents_dir)
     uins = []
+    zero_uins = []
     for root in roots:
         if not os.path.isdir(root):
             continue
+        for uin in _config_last_uins(root):
+            target = zero_uins if uin == 0 else uins
+            if uin not in target:
+                target.append(uin)
         try:
             filenames = os.listdir(root)
         except OSError:
@@ -895,10 +1154,68 @@ def _kvcomm_uins(documents_dir):
             if not match:
                 continue
             try:
-                uins.append(int(match.group(1)))
+                uin = int(match.group(1))
             except ValueError:
                 continue
+            target = zero_uins if uin == 0 else uins
+            if uin not in target:
+                target.append(uin)
+    return uins or zero_uins
+
+
+def _kvcomm_roots(documents_dir):
+    roots = [
+        os.path.join(documents_dir, "app_data", "radium", "ilink"),
+        os.path.join(documents_dir, "app_data", "net", "kvcomm"),
+        os.path.join(documents_dir, "app_data", "ilink", "kvcomm"),
+    ]
+    expanded = []
+    for root in roots:
+        if root.endswith(os.path.join("radium", "ilink")):
+            if not os.path.isdir(root):
+                continue
+            try:
+                account_dirs = os.listdir(root)
+            except OSError:
+                continue
+            for account_dir in account_dirs:
+                expanded.append(os.path.join(root, account_dir, "kvcomm"))
+            continue
+        expanded.append(root)
+    return expanded
+
+
+def _config_last_uins(root):
+    path = os.path.join(root, "config.ini")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    uins = []
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != "last_uin":
+            continue
+        uin = _parse_uin_token(value.strip())
+        if uin is not None:
+            uins.append(uin)
     return uins
+
+
+def _parse_uin_token(value):
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    padded = value + ("=" * (-len(value) % 4))
+    try:
+        decoded = base64.b64decode(padded, validate=True).decode("ascii", errors="strict").strip()
+    except Exception:
+        return None
+    if decoded.isdigit():
+        return int(decoded)
+    return None
 
 
 def _is_valid_bmp(data):

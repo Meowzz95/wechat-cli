@@ -192,8 +192,27 @@ def _wxgf_with_partition(payload):
     return header + len(payload).to_bytes(4, "big") + payload
 
 
-def _gif_bytes():
-    return b"GIF89a" + b"\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+def _png_bytes(width=72, height=80):
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + (13).to_bytes(4, "big")
+        + b"IHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+        + b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+
+def _gif_bytes(width=300, height=304):
+    return (
+        b"GIF89a"
+        + width.to_bytes(2, "little")
+        + height.to_bytes(2, "little")
+        + b"\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x00\x00\x00\x00\x00,"
+        + b"\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+    )
 
 
 def _sticker_xml(sticker_md5, aeskey="5fd76e9a49304191ab82949d45931e89", cdnurl="https://example.test/cdn", encrypturl="https://example.test/encrypt"):
@@ -286,12 +305,46 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(ext, "jpg")
             self.assertEqual(mime, "image/jpeg")
 
+    def test_decode_wechat_image_dat_decodes_v2_with_radium_config_uin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            documents_dir = os.path.join(tmp, "Documents")
+            net_kvcomm = os.path.join(documents_dir, "app_data", "net", "kvcomm")
+            radium_kvcomm = os.path.join(
+                documents_dir, "app_data", "radium", "ilink",
+                "7e99a3705453335bbe64eb651661c573", "kvcomm",
+            )
+            os.makedirs(net_kvcomm)
+            os.makedirs(radium_kvcomm)
+            with open(os.path.join(net_kvcomm, "key_0_4066646122_1_1780474260_299727447_3600_input.statistic"), "wb") as f:
+                f.write(b"")
+            with open(os.path.join(radium_kvcomm, "config.ini"), "w", encoding="utf-8") as f:
+                f.write("last_uin=MzUyNzQ1OTE1\n")
+
+            media_dir = os.path.join(
+                documents_dir, "xwechat_files", "catmoment123_7e99",
+                "msg", "attach", "0" * 32, "2026-06", "Img",
+            )
+            os.makedirs(media_dir)
+            src = os.path.join(media_dir, "a" * 32 + ".dat")
+            png = _png_bytes(72, 80)
+            data = _wechat_v2_image_dat(png)
+            with open(src, "wb") as f:
+                f.write(data)
+
+            decoded = decode_wechat_image_dat(data, source_path=src)
+
+            self.assertIsNotNone(decoded)
+            decoded_data, ext, mime = decoded
+            self.assertEqual(decoded_data, png)
+            self.assertEqual(ext, "png")
+            self.assertEqual(mime, "image/png")
+
     def test_materialize_media_decodes_dat_and_uses_relative_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "image.dat")
-            jpeg = bytes.fromhex("ffd8ffe000104a464946") + b"payload"
+            png = _png_bytes(72, 80)
             with open(src, "wb") as f:
-                f.write(_xor(jpeg))
+                f.write(_xor(png))
 
             output_path = os.path.join(tmp, "chat.json")
             assets_dir = os.path.join(tmp, "chat_assets")
@@ -306,7 +359,9 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(warnings, [])
             media = records[0]["media"][0]
             self.assertEqual(media["status"], "decoded")
-            self.assertEqual(media["mime"], "image/jpeg")
+            self.assertEqual(media["mime"], "image/png")
+            self.assertEqual(media["width"], 72)
+            self.assertEqual(media["height"], 80)
             self.assertTrue(media["path"].startswith("chat_assets/images/"))
             self.assertTrue(os.path.exists(os.path.join(tmp, media["path"])))
             self.assertNotIn("_media_sources", records[0])
@@ -365,7 +420,7 @@ class JsonExportTests(unittest.TestCase):
             src = _write_v2_media_context(tmp, f"{resource_hash}.dat")
             high_src = os.path.join(os.path.dirname(src), f"{resource_hash}_h.dat")
             wxgf_payload = b"wxgf" + (b"\x00" * 64)
-            png = bytes.fromhex("89504e470d0a1a0a") + b"payload-after-prefix"
+            png = _png_bytes(640, 480)
             with open(src, "wb") as f:
                 f.write(_wechat_v2_image_dat(wxgf_payload))
             with open(high_src, "wb") as f:
@@ -385,6 +440,8 @@ class JsonExportTests(unittest.TestCase):
             media = records[0]["media"][0]
             self.assertEqual(media["status"], "decoded")
             self.assertEqual(media["mime"], "image/png")
+            self.assertEqual(media["width"], 640)
+            self.assertEqual(media["height"], 480)
             self.assertTrue(media["path"].endswith(".png"))
             with open(os.path.join(tmp, media["path"]), "rb") as f:
                 self.assertEqual(f.read(), png)
@@ -411,6 +468,60 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(warnings[0]["local_id"], 12)
             self.assertEqual(warnings[0]["status"], "missing")
             self.assertFalse(os.path.exists(assets_dir))
+
+    def test_materialize_video_adds_ffprobe_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "clip.mp4")
+            with open(src, "wb") as f:
+                f.write(b"fake mp4")
+
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [{
+                "local_id": 43,
+                "time": "2026-06-03 10:17:30",
+                "_media_sources": [{"kind": "video", "source_path": src, "original_filename": "clip.mp4"}],
+            }]
+
+            with patch(
+                "wechat_cli.core.media_export._probe_ffprobe_metadata",
+                return_value=({"width": 1920, "height": 1080, "duration_ms": 1234}, ""),
+            ):
+                warnings = materialize_record_media(records, assets_dir, output_path)
+
+            self.assertEqual(warnings, [])
+            media = records[0]["media"][0]
+            self.assertEqual(media["status"], "copied")
+            self.assertEqual(media["width"], 1920)
+            self.assertEqual(media["height"], 1080)
+            self.assertEqual(media["duration_ms"], 1234)
+
+    def test_materialize_audio_probe_failure_warns_without_failing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "voice.aud")
+            with open(src, "wb") as f:
+                f.write(b"fake audio")
+
+            output_path = os.path.join(tmp, "chat.json")
+            assets_dir = os.path.join(tmp, "chat_assets")
+            records = [{
+                "local_id": 34,
+                "time": "2026-06-03 10:17:45",
+                "_media_sources": [{"kind": "voice", "source_path": src, "original_filename": "voice.aud"}],
+            }]
+
+            with patch(
+                "wechat_cli.core.media_export._probe_ffprobe_metadata",
+                return_value=({}, "ffprobe failed"),
+            ):
+                warnings = materialize_record_media(records, assets_dir, output_path)
+
+            media = records[0]["media"][0]
+            self.assertEqual(media["status"], "copied")
+            self.assertNotIn("duration_ms", media)
+            self.assertEqual(warnings[0]["local_id"], 34)
+            self.assertEqual(warnings[0]["status"], "metadata_unavailable")
+            self.assertIn("ffprobe failed", warnings[0]["detail"])
 
     def test_materialize_sticker_downloads_cdn_gif(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -691,9 +802,9 @@ class JsonExportTests(unittest.TestCase):
             os.makedirs(image_dir)
             os.makedirs(db_dir)
             image_path = os.path.join(image_dir, "photo.dat")
-            jpeg = bytes.fromhex("ffd8ffe000104a464946") + b"payload"
+            png = _png_bytes(72, 80)
             with open(image_path, "wb") as f:
-                f.write(_xor(jpeg))
+                f.write(_xor(png))
 
             message_db = os.path.join(tmp, "message.db")
             ts = int(datetime(2026, 6, 3, 10, 0).timestamp())
@@ -722,6 +833,8 @@ class JsonExportTests(unittest.TestCase):
             self.assertEqual(payload["chat"]["username"], CHAT_USERNAME)
             media = payload["messages"][1]["media"][0]
             self.assertEqual(media["status"], "decoded")
+            self.assertEqual(media["width"], 72)
+            self.assertEqual(media["height"], 80)
             self.assertTrue(media["path"].startswith("chat_assets/images/"))
             self.assertTrue(os.path.exists(os.path.join(tmp, media["path"])))
             self.assertTrue(os.path.exists(readme_path))
@@ -752,9 +865,9 @@ class JsonExportTests(unittest.TestCase):
             os.makedirs(image_dir)
             os.makedirs(db_dir)
             resource_hash = "abcdef0123456789abcdef0123456789"
-            jpeg = bytes.fromhex("ffd8ffe000104a464946") + b"payload"
+            png = _png_bytes(72, 80)
             with open(os.path.join(image_dir, f"{resource_hash}.dat"), "wb") as f:
-                f.write(_xor(jpeg))
+                f.write(_xor(png))
             with open(os.path.join(image_dir, "unrelated.dat"), "wb") as f:
                 f.write(b"unrelated")
 
